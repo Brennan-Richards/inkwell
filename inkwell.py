@@ -14,7 +14,7 @@ def answer_question(question):
         PAGE_ONE_DOCUMENTATION = file.read()
 
     # Configuration
-    API_KEY = "e3944e0b04fa4d9e9039a72ea417f227"
+    API_KEY = "3c39f0eb0fa54a9f8cd5d54995e3a3f4"
     headers = {
         "Content-Type": "application/json",
         "api-key": API_KEY,
@@ -51,7 +51,7 @@ def answer_question(question):
     }
 
     ENDPOINT = "https://your-resource-name.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview"
-
+    
     # Send request
     try:
         response = requests.post(ENDPOINT, headers=headers, json=payload)
@@ -80,8 +80,8 @@ async def on_message(message):
         return
 
     # Use the OpenAI API to generate a response
-    # response = answer_question(message.content)
-    response = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
+    response = answer_question(message.content)
+    # response = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
     response_text = response['choices'][0]['message']['content']
 
     # Debugging: Print the generated response
@@ -91,9 +91,9 @@ async def on_message(message):
     await message.channel.send(response_text)
 
 
-# client.run('REDACTED-DISCORD-BOT-TOKEN')
-answer = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
-response_text = answer['choices'][0]['message']['content']
-print(answer)
-print(type(answer))
-print(response_text)
+client.run('REDACTED-DISCORD-BOT-TOKEN')
+# answer = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
+# response_text = answer['choices'][0]['message']['content']
+# print(answer)
+# print(type(answer))
+# print(response_text)
