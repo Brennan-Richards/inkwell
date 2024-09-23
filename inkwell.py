@@ -10,7 +10,7 @@ import base64
 def answer_question(question):
     PAGE_ONE_DOCUMENTATION = ""
     # Read in the page one docs from page_one_server_list.txt
-    with open("page_one_server_list.txt", "r") as file:
+    with open("page_one_inkwell_list.txt", "r") as file:
         PAGE_ONE_DOCUMENTATION = file.read()
 
     # Configuration
@@ -84,8 +84,12 @@ async def on_message(message):
     # response = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
     response_text = response['choices'][0]['message']['content']
 
+    print("-" * 50)
+    print(f"User message: {message.content}")
+
     # Debugging: Print the generated response
     print(f"Generated response: {response_text}")
+    print("-" * 50)
 
     # Send the response to the channel
     await message.channel.send(response_text)
