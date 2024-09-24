@@ -28,7 +28,7 @@ def answer_question(question):
         "content": [
             {
             "type": "text",
-            "text": f"""You are an AI assistant that helps direct people towards the ways that they should leverage a discord server called Page One, which you are installed on.
+            "text": f"""You are an AI assistant named Inkwell that helps direct people towards the ways that they should leverage a discord server called Page One, which you are installed on.
                         Users will ask you questions about where they should post or interact with the discord server.
                         Answer users' questions based on the following guidelines which contain a list of all of the places to post on the server: 
                         { PAGE_ONE_DOCUMENTATION }
