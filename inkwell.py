@@ -1,69 +1,86 @@
 # This example requires the 'message_content' intent.
 
 import discord
-
 import os
-import requests
-import base64
+import aiohttp
+import asyncio
+import logging
+# Solve environment variables appearing unset
+from dotenv import load_dotenv
+load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
 
-def answer_question(question):
-    PAGE_ONE_DOCUMENTATION = ""
-    # Read in the page one docs from page_one_server_list.txt
+def load_page_one_documentation():
+    # Read in the page one docs from page_one_inkwell_list.txt
     with open("page_one_inkwell_list.txt", "r") as file:
-        PAGE_ONE_DOCUMENTATION = file.read()
+        page_one_documentation = file.read()
+    return page_one_documentation
 
-    # Configuration
-    API_KEY = "3c39f0eb0fa54a9f8cd5d54995e3a3f4"
-    headers = {
-        "Content-Type": "application/json",
-        "api-key": API_KEY,
-    }
+PAGE_ONE_DOCUMENTATION = load_page_one_documentation()
 
+# Configuration
+endpoint = "https://your-resource-name.openai.azure.com/"
+deployment_name = "gpt-4o"  # Ensure this matches your deployment name in Azure
+api_version = "2024-08-01-preview"  # Verify this is the correct API version
+
+# It's safer to use environment variables for API keys and tokens
+API_KEY = os.getenv('AZURE_OPENAI_API_KEY')
+if not API_KEY:
+    raise ValueError("AZURE_OPENAI_API_KEY environment variable is not set.")
+
+headers = {
+    "Content-Type": "application/json",
+    "api-key": API_KEY,
+}
+
+async def answer_question(question):
     # Payload for the request
     payload = {
-    "messages": [
-        {
-        "role": "system",
-        "content": [
+        "messages": [
             {
-            "type": "text",
-            "text": f"""You are an AI assistant named Inkwell that helps direct people towards the ways that they should leverage a discord server called Page One, which you are installed on.
-                        Users will ask you questions about where they should post or interact with the discord server.
-                        Answer users' questions based on the following guidelines which contain a list of all of the places to post on the server: 
-                        { PAGE_ONE_DOCUMENTATION }
-            """
-            },
-        ]
-        },
-        {
-            "role": "user",
+                "role": "system",
                 "content": [
                     {
-                    "type": "text",
-                    "text": question
+                        "type": "text",
+                        "text": f"""You are an AI assistant named Inkwell that helps direct people towards the ways that they should leverage a Discord server called Page One, which you are installed on.
+Users will ask you questions about where they should post or interact with the Discord server.
+Answer users' questions based on the following guidelines, which contain a list of all the places to post on the server:
+{PAGE_ONE_DOCUMENTATION}
+                        """
+                    },
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": question
                     }
                 ]
-        }
-    ],
-    "temperature": 0.1,
-    "max_tokens": 800
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 800
     }
 
-    ENDPOINT = "https://your-resource-name.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview"
-    
+    endpoint_url = f"{endpoint}openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
+
     # Send request
     try:
-        response = requests.post(ENDPOINT, headers=headers, json=payload)
-        response.raise_for_status()  # Will raise an HTTPError if the HTTP request returned an unsuccessful status code
-    except requests.RequestException as e:
-        raise SystemExit(f"Failed to make the request. Error: {e}")
-
-    # Handle the response as needed (e.g., print or process)
-    # print(response.json())
-
-    # Return the response as a dictionary
-    return response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(endpoint_url, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    error_message = await response.text()
+                    logging.error(f"HTTP Error {response.status}: {error_message}")
+                    # Optionally, parse the error message to provide more details
+                    return "I'm sorry, but I'm having trouble processing your request right now. This may go against my policies."
+                result = await response.json()
+                return result['choices'][0]['message']['content']
+    except Exception as e:
+        logging.exception("An unexpected error occurred.")
+        return "An unexpected error occurred. Please try again later."
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -80,9 +97,7 @@ async def on_message(message):
         return
 
     # Use the OpenAI API to generate a response
-    response = answer_question(message.content)
-    # response = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
-    response_text = response['choices'][0]['message']['content']
+    response_text = await answer_question(message.content)
 
     print("-" * 50)
     print(f"User message: {message.content}")
@@ -94,10 +109,9 @@ async def on_message(message):
     # Send the response to the channel
     await message.channel.send(response_text)
 
+# Use environment variable for Discord bot token
+DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+if not DISCORD_BOT_TOKEN:
+    raise ValueError("DISCORD_BOT_TOKEN environment variable is not set.")
 
-client.run('REDACTED-DISCORD-BOT-TOKEN')
-# answer = answer_question("Where should I post my story about femininity that flips femininity into a strength?")
-# response_text = answer['choices'][0]['message']['content']
-# print(answer)
-# print(type(answer))
-# print(response_text)
+client.run(DISCORD_BOT_TOKEN)
