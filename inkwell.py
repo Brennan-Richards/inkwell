@@ -50,7 +50,7 @@ def answer_question(question):
     "max_tokens": 800
     }
 
-    ENDPOINT = "https://your-resource-name.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview"
+    ENDPOINT = "https://your-resource-name.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview"
     
     # Send request
     try:
