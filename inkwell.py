@@ -5,6 +5,7 @@ import os
 import aiohttp
 import asyncio
 import logging
+import PyPDF2
 # Solve environment variables appearing unset
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,9 +13,28 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 def load_page_one_documentation():
+
     # Read in the page one docs from page_one_inkwell_list.txt
-    with open("page_one_inkwell_list.txt", "r") as file:
-        page_one_documentation = file.read()
+    # with open("page_one_inkwell_list.txt", "r") as file:
+    #     page_one_documentation = file.read()
+
+    page_one_documentation = ""
+    # Read in all the PDFs in the 'documentation' directory and add their contents to the page_one_documentation
+    for filename in os.listdir("documentation"):
+        if filename.endswith(".pdf"):
+            with open(f"documentation/{filename}", "rb") as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page_number in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_number]
+                    _docs = page.extract_text()
+                    # Remove all newlines and replace them with spaces
+                    _docs = _docs.replace("\n", " ")
+                    page_one_documentation += _docs
+
+    # Write the page_one_documentation to a TXT file
+    # with open("page-one-docs-11042024.txt", "w") as file:
+    #     file.write(page_one_documentation)
+
     return page_one_documentation
 
 PAGE_ONE_DOCUMENTATION = load_page_one_documentation()
