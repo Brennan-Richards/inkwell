@@ -1,137 +1,338 @@
-# This example requires the 'message_content' intent.
-
-import discord
-import os
-import aiohttp
-import asyncio
 import logging
-import PyPDF2
-# Solve environment variables appearing unset
-from dotenv import load_dotenv
-load_dotenv()
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
 
+import aiohttp
+import discord
+import PyPDF2
+from dotenv import load_dotenv
+
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-def load_page_one_documentation():
+BASE_DIR = Path(__file__).resolve().parent
 
-    # Read in the page one docs from page_one_inkwell_list.txt
-    # with open("page_one_inkwell_list.txt", "r") as file:
-    #     page_one_documentation = file.read()
 
-    page_one_documentation = ""
-    # Read in all the PDFs in the 'documentation' directory and add their contents to the page_one_documentation
-    for filename in os.listdir("documentation"):
-        if filename.endswith(".pdf"):
-            with open(f"documentation/{filename}", "rb") as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page_number in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_number]
-                    _docs = page.extract_text()
-                    # Remove all newlines and replace them with spaces
-                    _docs = _docs.replace("\n", " ")
-                    page_one_documentation += _docs
+@dataclass(frozen=True)
+class BotConfig:
+    discord_bot_token: str
+    azure_openai_api_key: str
+    azure_openai_endpoint: str
+    azure_openai_deployment: str
+    temperature: float
+    max_output_tokens: int
+    max_knowledge_chars: int
+    allowed_channels: set[str]
+    knowledge_override_path: str | None
 
-    # Write the page_one_documentation to a TXT file
-    # with open("page-one-docs-11042024.txt", "w") as file:
-    #     file.write(page_one_documentation)
 
-    return page_one_documentation
+BOT_CONFIG: BotConfig | None = None
+KNOWLEDGE_SOURCE_PATH = ""
+PAGE_ONE_DOCUMENTATION = ""
+SYSTEM_PROMPT = ""
 
-PAGE_ONE_DOCUMENTATION = load_page_one_documentation()
 
-# Configuration
-endpoint = "https://your-resource-name.openai.azure.com/"
-deployment_name = "gpt-4o"  # Ensure this matches your deployment name in Azure
-api_version = "2024-08-01-preview"  # Verify this is the correct API version
+def parse_allowed_channels(raw_value: str | None) -> set[str]:
+    if not raw_value:
+        return {"ask-inkwell"}
+    channels = {item.strip().lower() for item in raw_value.split(",") if item.strip()}
+    return channels or {"ask-inkwell"}
 
-# It's safer to use environment variables for API keys and tokens
-API_KEY = os.getenv('AZURE_OPENAI_API_KEY')
-if not API_KEY:
-    raise ValueError("AZURE_OPENAI_API_KEY environment variable is not set.")
 
-headers = {
-    "Content-Type": "application/json",
-    "api-key": API_KEY,
-}
+def _safe_int(value: str | None, default: int) -> int:
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Invalid integer value '%s'. Using default %d.", value, default)
+        return default
 
-async def answer_question(question):
-    # Payload for the request
-    payload = {
-        "messages": [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"""You are an AI assistant named Inkwell that helps direct people towards the ways that they should leverage a Discord server called Page One, which you are installed on.
-Users will ask you questions about where they should post or interact with the Discord server.
-Answer users' questions based on the following guidelines, which contain a list of all the places to post on the server:
-{PAGE_ONE_DOCUMENTATION}
-                        """
-                    },
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": question
-                    }
-                ]
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": 800
+
+def _safe_float(value: str | None, default: float) -> float:
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logging.warning("Invalid float value '%s'. Using default %.2f.", value, default)
+        return default
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"{name} environment variable is not set.")
+    return value
+
+
+def build_config() -> BotConfig:
+    return BotConfig(
+        discord_bot_token=_required_env("DISCORD_BOT_TOKEN"),
+        azure_openai_api_key=_required_env("AZURE_OPENAI_API_KEY"),
+        azure_openai_endpoint=os.getenv(
+            "AZURE_OPENAI_ENDPOINT",
+            "https://your-resource-name.openai.azure.com",
+        ).rstrip("/"),
+        azure_openai_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"),
+        temperature=_safe_float(os.getenv("INKWELL_TEMPERATURE"), 0.15),
+        max_output_tokens=_safe_int(os.getenv("INKWELL_MAX_OUTPUT_TOKENS"), 700),
+        max_knowledge_chars=_safe_int(os.getenv("INKWELL_MAX_KNOWLEDGE_CHARS"), 120000),
+        allowed_channels=parse_allowed_channels(os.getenv("INKWELL_ALLOWED_CHANNELS")),
+        knowledge_override_path=os.getenv("INKWELL_MASTER_DOCUMENT_PATH"),
+    )
+
+
+def discover_default_knowledge_sources(base_dir: Path) -> list[Path]:
+    candidate_paths: list[Path] = []
+    search_roots = [base_dir / "documentation", base_dir.parent]
+    patterns = [
+        "*Inkwell*Training*Guide*.pdf",
+        "*MASTER*DOCUMENT*.pdf",
+        "*Master*Document*.pdf",
+    ]
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            candidate_paths.extend(sorted(root.glob(pattern)))
+
+    candidate_paths.append(base_dir / "page-one-docs-11042024.txt")
+
+    # De-dupe while preserving order.
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidate_paths:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
+def resolve_knowledge_source(base_dir: Path, override_path: str | None) -> Path:
+    if override_path:
+        resolved = Path(override_path).expanduser()
+        if not resolved.is_absolute():
+            resolved = (base_dir / resolved).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"Configured document path does not exist: {resolved}"
+            )
+        return resolved
+
+    for candidate in discover_default_knowledge_sources(base_dir):
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "No knowledge source found. Set INKWELL_MASTER_DOCUMENT_PATH "
+        "or add a training document to documentation/."
+    )
+
+
+def _read_pdf_text(path: Path) -> str:
+    extracted_chunks: list[str] = []
+    with path.open("rb") as file_handle:
+        pdf_reader = PyPDF2.PdfReader(file_handle)
+        for page in pdf_reader.pages:
+            extracted_chunks.append(page.extract_text() or "")
+    return " ".join(extracted_chunks)
+
+
+def load_knowledge_text(path: Path, max_chars: int) -> str:
+    if path.suffix.lower() == ".pdf":
+        raw_text = _read_pdf_text(path)
+    else:
+        raw_text = path.read_text(encoding="utf-8")
+
+    normalized = re.sub(r"\s+", " ", raw_text).strip()
+    if len(normalized) > max_chars:
+        logging.warning(
+            "Knowledge text exceeded %d chars and was truncated.",
+            max_chars,
+        )
+        normalized = normalized[:max_chars]
+    return normalized
+
+
+def build_system_prompt(knowledge_text: str) -> str:
+    return (
+        "You are Inkwell, the Page One Discord assistant. "
+        "Help members quickly find the right channel, program, or rule.\n\n"
+        "Response policy:\n"
+        "- Be concise, clear, and practical.\n"
+        "- Prioritize routing users to the best channel or next action.\n"
+        "- Never invent rules or channels. Use only the documented source below.\n"
+        "- If uncertain, say so briefly and escalate to #server-questions or a moderator.\n"
+        "- Keep tone warm and community-first, but not overly chatty.\n\n"
+        "Authoritative Page One documentation follows:\n"
+        f"{knowledge_text}"
+    )
+
+
+def should_respond_to_message(
+    *,
+    author_is_bot: bool,
+    is_dm: bool,
+    channel_name: str,
+    mentions_bot: bool,
+    allowed_channels: set[str],
+) -> bool:
+    if author_is_bot:
+        return False
+    if is_dm or mentions_bot:
+        return True
+    return channel_name.lower() in allowed_channels
+
+
+def strip_bot_mentions(message_content: str, bot_user_id: int | None) -> str:
+    if not bot_user_id:
+        return message_content.strip()
+    cleaned = message_content.replace(f"<@{bot_user_id}>", "")
+    cleaned = cleaned.replace(f"<@!{bot_user_id}>", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def build_responses_payload(question: str, system_prompt: str, config: BotConfig) -> dict:
+    return {
+        "model": config.azure_openai_deployment,
+        "instructions": system_prompt,
+        "input": question,
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
     }
 
-    endpoint_url = f"{endpoint}openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
 
-    # Send request
+def extract_response_text(response_json: dict) -> str:
+    direct_text = response_json.get("output_text")
+    if isinstance(direct_text, str) and direct_text.strip():
+        return direct_text.strip()
+
+    output_items = response_json.get("output", [])
+    text_chunks: list[str] = []
+    for item in output_items:
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"}:
+                chunk = (content.get("text") or "").strip()
+                if chunk:
+                    text_chunks.append(chunk)
+    return "\n".join(text_chunks).strip()
+
+
+async def answer_question(question: str) -> str:
+    if not BOT_CONFIG:
+        logging.error("Bot config is not initialized.")
+        return "Inkwell is still booting. Please try again in a moment."
+
+    endpoint_url = f"{BOT_CONFIG.azure_openai_endpoint}/openai/v1/responses"
+    payload = build_responses_payload(question, SYSTEM_PROMPT, BOT_CONFIG)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BOT_CONFIG.azure_openai_api_key}",
+        "api-key": BOT_CONFIG.azure_openai_api_key,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=60)
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(endpoint_url, headers=headers, json=payload) as response:
                 if response.status != 200:
                     error_message = await response.text()
-                    logging.error(f"HTTP Error {response.status}: {error_message}")
-                    # Optionally, parse the error message to provide more details
-                    return "I'm sorry, but I'm having trouble processing your request right now. This may go against my policies."
+                    logging.error("HTTP Error %s: %s", response.status, error_message)
+                    return (
+                        "I'm having trouble pulling the latest guidance right now. "
+                        "Please ask in #server-questions or tag a moderator."
+                    )
+
                 result = await response.json()
-                return result['choices'][0]['message']['content']
-    except Exception as e:
-        logging.exception("An unexpected error occurred.")
-        return "An unexpected error occurred. Please try again later."
+                answer_text = extract_response_text(result)
+                if answer_text:
+                    return answer_text
+
+                logging.error("Responses API returned no text. Payload: %s", result)
+                return (
+                    "I couldn't generate a clear answer yet. "
+                    "Please try again, or ask in #server-questions."
+                )
+    except Exception:
+        logging.exception("Unexpected error while calling Azure OpenAI.")
+        return (
+            "I hit an unexpected error while checking the docs. "
+            "Please ask in #server-questions or tag a moderator."
+        )
+
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 client = discord.Client(intents=intents)
+
 
 @client.event
 async def on_ready():
-    print(f'We have logged in as {client.user}')
+    logging.info("Logged in as %s", client.user)
+    if KNOWLEDGE_SOURCE_PATH:
+        logging.info("Knowledge source: %s", KNOWLEDGE_SOURCE_PATH)
+
 
 @client.event
 async def on_message(message):
-    if message.author == client.user:
+    if not BOT_CONFIG or message.author == client.user:
         return
 
-    # Use the OpenAI API to generate a response
-    response_text = await answer_question(message.content)
+    mentions_bot = bool(client.user and client.user in message.mentions)
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    channel_name = getattr(message.channel, "name", "")
+    author_is_bot = bool(getattr(message.author, "bot", False))
 
-    print("-" * 50)
-    print(f"User message: {message.content}")
+    if not should_respond_to_message(
+        author_is_bot=author_is_bot,
+        is_dm=is_dm,
+        channel_name=channel_name,
+        mentions_bot=mentions_bot,
+        allowed_channels=BOT_CONFIG.allowed_channels,
+    ):
+        return
 
-    # Debugging: Print the generated response
-    print(f"Generated response: {response_text}")
-    print("-" * 50)
+    cleaned_message = strip_bot_mentions(
+        message.content or "",
+        client.user.id if client.user else None,
+    )
+    if not cleaned_message:
+        return
 
-    # Send the response to the channel
+    response_text = await answer_question(cleaned_message)
     await message.channel.send(response_text)
 
-# Use environment variable for Discord bot token
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-if not DISCORD_BOT_TOKEN:
-    raise ValueError("DISCORD_BOT_TOKEN environment variable is not set.")
 
-client.run(DISCORD_BOT_TOKEN)
+def initialize_runtime() -> None:
+    global BOT_CONFIG, KNOWLEDGE_SOURCE_PATH, PAGE_ONE_DOCUMENTATION, SYSTEM_PROMPT
+
+    BOT_CONFIG = build_config()
+    knowledge_source = resolve_knowledge_source(BASE_DIR, BOT_CONFIG.knowledge_override_path)
+    knowledge_text = load_knowledge_text(knowledge_source, BOT_CONFIG.max_knowledge_chars)
+
+    KNOWLEDGE_SOURCE_PATH = str(knowledge_source)
+    PAGE_ONE_DOCUMENTATION = knowledge_text
+    SYSTEM_PROMPT = build_system_prompt(knowledge_text)
+
+    logging.info(
+        "Loaded %d characters from %s",
+        len(knowledge_text),
+        knowledge_source,
+    )
+    logging.info("Allowed response channels: %s", sorted(BOT_CONFIG.allowed_channels))
+
+
+def main() -> None:
+    initialize_runtime()
+    client.run(BOT_CONFIG.discord_bot_token)
+
+
+if __name__ == "__main__":
+    main()
