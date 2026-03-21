@@ -5,6 +5,17 @@ from pathlib import Path
 import inkwell
 
 
+class FakeChannel:
+    def __init__(self, channel_id: int, name: str):
+        self.id = channel_id
+        self.name = name
+
+
+class FakeGuild:
+    def __init__(self, channels):
+        self.channels = channels
+
+
 class InkwellHelpersTest(unittest.TestCase):
     def test_parse_allowed_channels(self):
         channels = inkwell.parse_allowed_channels(" ask-inkwell,server-questions , ")
@@ -77,6 +88,65 @@ class InkwellHelpersTest(unittest.TestCase):
 
             loaded = inkwell.load_knowledge_text(text_path, max_chars=7)
             self.assertEqual(loaded, "one two")
+
+    def test_build_channel_reference_maps(self):
+        guild = FakeGuild([FakeChannel(101, "server-questions"), FakeChannel(102, "introductions")])
+        refs_by_name, refs_by_id = inkwell.build_channel_reference_maps(guild)
+
+        self.assertIn("server-questions", refs_by_name)
+        self.assertIn(101, refs_by_id)
+        self.assertEqual(refs_by_name["introductions"].mention, "<#102>")
+
+    def test_add_channel_links_to_response_for_hashtag(self):
+        refs_by_name = {"server-questions": inkwell.ChannelReference(101, "server-questions")}
+        refs_by_id = {101: refs_by_name["server-questions"]}
+
+        updated = inkwell.add_channel_links_to_response(
+            "Ask in #server-questions if you need help.",
+            refs_by_name,
+            refs_by_id,
+        )
+        self.assertIn("#server-questions (<#101>)", updated)
+
+    def test_add_channel_links_to_response_for_mention(self):
+        refs_by_name = {"server-questions": inkwell.ChannelReference(101, "server-questions")}
+        refs_by_id = {101: refs_by_name["server-questions"]}
+
+        updated = inkwell.add_channel_links_to_response(
+            "Ask in <#101> if you need help.",
+            refs_by_name,
+            refs_by_id,
+        )
+        self.assertEqual(
+            updated,
+            "Ask in #server-questions (<#101>) if you need help.",
+        )
+
+    def test_add_channel_links_to_response_for_bare_name_with_channel_word(self):
+        refs_by_name = {"introductions": inkwell.ChannelReference(102, "introductions")}
+        refs_by_id = {102: refs_by_name["introductions"]}
+
+        updated = inkwell.add_channel_links_to_response(
+            "Post in introductions channel first.",
+            refs_by_name,
+            refs_by_id,
+        )
+        self.assertEqual(
+            updated,
+            "Post in #introductions (<#102>) channel first.",
+        )
+
+    def test_add_channel_links_does_not_duplicate_existing_format(self):
+        refs_by_name = {"introductions": inkwell.ChannelReference(102, "introductions")}
+        refs_by_id = {102: refs_by_name["introductions"]}
+        original = "Post in #introductions (<#102>) channel first."
+
+        updated = inkwell.add_channel_links_to_response(
+            original,
+            refs_by_name,
+            refs_by_id,
+        )
+        self.assertEqual(updated, original)
 
 
 if __name__ == "__main__":

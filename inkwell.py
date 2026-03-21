@@ -28,6 +28,20 @@ class BotConfig:
     knowledge_override_path: str | None
 
 
+@dataclass(frozen=True)
+class ChannelReference:
+    channel_id: int
+    name: str
+
+    @property
+    def hashtag(self) -> str:
+        return f"#{self.name}"
+
+    @property
+    def mention(self) -> str:
+        return f"<#{self.channel_id}>"
+
+
 BOT_CONFIG: BotConfig | None = None
 KNOWLEDGE_SOURCE_PATH = ""
 PAGE_ONE_DOCUMENTATION = ""
@@ -168,6 +182,7 @@ def build_system_prompt(knowledge_text: str) -> str:
         "Response policy:\n"
         "- Be concise, clear, and practical.\n"
         "- Prioritize routing users to the best channel or next action.\n"
+        "- When referencing a channel, always include the hashtag (for example #server-questions).\n"
         "- Never invent rules or channels. Use only the documented source below.\n"
         "- If uncertain, say so briefly and escalate to #server-questions or a moderator.\n"
         "- Keep tone warm and community-first, but not overly chatty.\n\n"
@@ -197,6 +212,92 @@ def strip_bot_mentions(message_content: str, bot_user_id: int | None) -> str:
     cleaned = message_content.replace(f"<@{bot_user_id}>", "")
     cleaned = cleaned.replace(f"<@!{bot_user_id}>", "")
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def build_channel_reference_maps(
+    guild: discord.Guild | None,
+) -> tuple[dict[str, ChannelReference], dict[int, ChannelReference]]:
+    refs_by_name: dict[str, ChannelReference] = {}
+    refs_by_id: dict[int, ChannelReference] = {}
+    if guild is None:
+        return refs_by_name, refs_by_id
+
+    for channel in getattr(guild, "channels", []):
+        channel_name = getattr(channel, "name", None)
+        channel_id = getattr(channel, "id", None)
+        if not channel_name or not isinstance(channel_id, int):
+            continue
+
+        normalized_name = channel_name.strip().lower()
+        if not normalized_name:
+            continue
+
+        ref = ChannelReference(channel_id=channel_id, name=normalized_name)
+        refs_by_name[normalized_name] = ref
+        refs_by_id[channel_id] = ref
+
+    return refs_by_name, refs_by_id
+
+
+def _format_channel_reference(ref: ChannelReference) -> str:
+    return f"{ref.hashtag} ({ref.mention})"
+
+
+def add_channel_links_to_response(
+    response_text: str,
+    refs_by_name: dict[str, ChannelReference],
+    refs_by_id: dict[int, ChannelReference],
+) -> str:
+    if not response_text:
+        return response_text
+    if not refs_by_name and not refs_by_id:
+        return response_text
+
+    def mention_replacer(match: re.Match[str]) -> str:
+        channel_id = int(match.group(1))
+        ref = refs_by_id.get(channel_id)
+        if not ref:
+            return match.group(0)
+        lookback = match.string[max(0, match.start() - (len(ref.name) + 6)) : match.start()]
+        already_formatted = re.search(
+            rf"#{re.escape(ref.name)}\s*\($",
+            lookback,
+            flags=re.IGNORECASE,
+        )
+        if already_formatted:
+            return match.group(0)
+        return _format_channel_reference(ref)
+
+    linked_text = re.sub(r"<#(\d+)>", mention_replacer, response_text)
+    sorted_refs = sorted(refs_by_name.values(), key=lambda item: len(item.name), reverse=True)
+
+    for ref in sorted_refs:
+        escaped_name = re.escape(ref.name)
+        hashtag_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_])#{escaped_name}(?![A-Za-z0-9_])(?!\s*\(<#{ref.channel_id}>\))",
+            flags=re.IGNORECASE,
+        )
+        linked_text = hashtag_pattern.sub(
+            lambda _: _format_channel_reference(ref),
+            linked_text,
+        )
+
+        if "-" in ref.name:
+            bare_pattern = re.compile(
+                rf"(?<![#<A-Za-z0-9_]){escaped_name}(?![A-Za-z0-9_])(?=\s*(?:channel\b|channels\b|[.,!?)]|$))",
+                flags=re.IGNORECASE,
+            )
+        else:
+            bare_pattern = re.compile(
+                rf"(?<![#<A-Za-z0-9_]){escaped_name}(?![A-Za-z0-9_])(?=\s+channel\b)",
+                flags=re.IGNORECASE,
+            )
+        linked_text = bare_pattern.sub(
+            lambda _: _format_channel_reference(ref),
+            linked_text,
+        )
+
+    return linked_text
 
 
 def build_responses_payload(question: str, system_prompt: str, config: BotConfig) -> dict:
@@ -306,7 +407,13 @@ async def on_message(message):
     if not cleaned_message:
         return
 
+    channel_refs_by_name, channel_refs_by_id = build_channel_reference_maps(message.guild)
     response_text = await answer_question(cleaned_message)
+    response_text = add_channel_links_to_response(
+        response_text,
+        channel_refs_by_name,
+        channel_refs_by_id,
+    )
     await message.channel.send(response_text)
 
 
