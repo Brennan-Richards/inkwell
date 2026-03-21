@@ -1,8 +1,35 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import inkwell
+
+
+class FakeAuthor:
+    def __init__(self, author_id: int):
+        self.id = author_id
+
+
+class FakeReference:
+    def __init__(self, message_id: int):
+        self.message_id = message_id
+
+
+class FakeMessage:
+    def __init__(
+        self,
+        message_id: int,
+        author_id: int,
+        content: str,
+        created_at: datetime,
+        reference: FakeReference | None = None,
+    ):
+        self.id = message_id
+        self.author = FakeAuthor(author_id)
+        self.content = content
+        self.created_at = created_at
+        self.reference = reference
 
 
 class FakeChannel:
@@ -147,6 +174,61 @@ class InkwellHelpersTest(unittest.TestCase):
             refs_by_id,
         )
         self.assertEqual(updated, original)
+
+    def test_build_bounded_conversation_messages_keeps_related_followups(self):
+        now = datetime.now(timezone.utc)
+        history = [
+            FakeMessage(1, 999, "Ignore this", now - timedelta(minutes=6)),
+            FakeMessage(2, 42, "Where should I post intros?", now - timedelta(minutes=5)),
+            FakeMessage(3, 777, "Use #introductions.", now - timedelta(minutes=4)),
+            FakeMessage(4, 999, "More unrelated chatter", now - timedelta(minutes=3)),
+            FakeMessage(5, 777, "This was for someone else.", now - timedelta(minutes=2)),
+        ]
+
+        result = inkwell.build_bounded_conversation_messages(
+            history_messages=history,
+            current_message_id=6,
+            current_user_id=42,
+            bot_user_id=777,
+            current_user_text="What about moderator help?",
+            max_messages=12,
+            lookback_minutes=90,
+        )
+
+        self.assertEqual(
+            result,
+            [
+                {"role": "user", "content": "Where should I post intros?"},
+                {"role": "assistant", "content": "Use #introductions."},
+                {"role": "user", "content": "What about moderator help?"},
+            ],
+        )
+
+    def test_build_bounded_conversation_messages_excludes_old_context(self):
+        now = datetime.now(timezone.utc)
+        history = [
+            FakeMessage(10, 42, "Old question", now - timedelta(minutes=300)),
+            FakeMessage(11, 777, "Old answer", now - timedelta(minutes=299), reference=FakeReference(10)),
+            FakeMessage(12, 42, "Recent question", now - timedelta(minutes=10)),
+        ]
+
+        result = inkwell.build_bounded_conversation_messages(
+            history_messages=history,
+            current_message_id=13,
+            current_user_id=42,
+            bot_user_id=777,
+            current_user_text="Follow-up now",
+            max_messages=12,
+            lookback_minutes=90,
+        )
+
+        self.assertEqual(
+            result,
+            [
+                {"role": "user", "content": "Recent question"},
+                {"role": "user", "content": "Follow-up now"},
+            ],
+        )
 
 
 if __name__ == "__main__":

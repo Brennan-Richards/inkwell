@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -24,6 +25,9 @@ class BotConfig:
     temperature: float
     max_output_tokens: int
     max_knowledge_chars: int
+    followup_fetch_limit: int
+    followup_max_messages: int
+    followup_lookback_minutes: int
     allowed_channels: set[str]
     knowledge_override_path: str | None
 
@@ -94,6 +98,9 @@ def build_config() -> BotConfig:
         temperature=_safe_float(os.getenv("INKWELL_TEMPERATURE"), 0.15),
         max_output_tokens=_safe_int(os.getenv("INKWELL_MAX_OUTPUT_TOKENS"), 700),
         max_knowledge_chars=_safe_int(os.getenv("INKWELL_MAX_KNOWLEDGE_CHARS"), 120000),
+        followup_fetch_limit=_safe_int(os.getenv("INKWELL_FOLLOWUP_FETCH_LIMIT"), 60),
+        followup_max_messages=_safe_int(os.getenv("INKWELL_FOLLOWUP_MAX_MESSAGES"), 12),
+        followup_lookback_minutes=_safe_int(os.getenv("INKWELL_FOLLOWUP_LOOKBACK_MINUTES"), 90),
         allowed_channels=parse_allowed_channels(os.getenv("INKWELL_ALLOWED_CHANNELS")),
         knowledge_override_path=os.getenv("INKWELL_MASTER_DOCUMENT_PATH"),
     )
@@ -214,6 +221,123 @@ def strip_bot_mentions(message_content: str, bot_user_id: int | None) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def _normalize_context_text(
+    text: str,
+    *,
+    truncate_at: int = 1200,
+) -> str:
+    compact = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(compact) > truncate_at:
+        compact = compact[:truncate_at]
+    return compact
+
+
+def _message_within_lookback(
+    message: object,
+    *,
+    lookback_minutes: int,
+) -> bool:
+    created_at = getattr(message, "created_at", None)
+    if not isinstance(created_at, datetime):
+        return True
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, lookback_minutes))
+    return created_at >= cutoff
+
+
+def build_bounded_conversation_messages(
+    *,
+    history_messages: list[object],
+    current_message_id: int,
+    current_user_id: int,
+    bot_user_id: int | None,
+    current_user_text: str,
+    max_messages: int,
+    lookback_minutes: int,
+) -> list[dict[str, str]]:
+    selected: list[dict[str, str]] = []
+    seen_user_message_ids: set[int] = set()
+
+    for index, history_msg in enumerate(history_messages):
+        if getattr(history_msg, "id", None) == current_message_id:
+            continue
+        if not _message_within_lookback(history_msg, lookback_minutes=lookback_minutes):
+            continue
+
+        history_author = getattr(history_msg, "author", None)
+        history_author_id = getattr(history_author, "id", None)
+        history_text = _normalize_context_text(getattr(history_msg, "content", ""))
+        if not history_text:
+            continue
+
+        if history_author_id == current_user_id:
+            history_text = strip_bot_mentions(history_text, bot_user_id)
+            if history_text:
+                selected.append({"role": "user", "content": history_text})
+                history_message_id = getattr(history_msg, "id", None)
+                if isinstance(history_message_id, int):
+                    seen_user_message_ids.add(history_message_id)
+            continue
+
+        if bot_user_id and history_author_id == bot_user_id:
+            include_bot_message = False
+            history_reference = getattr(history_msg, "reference", None)
+            referenced_message_id = getattr(history_reference, "message_id", None)
+            if isinstance(referenced_message_id, int) and referenced_message_id in seen_user_message_ids:
+                include_bot_message = True
+            elif index > 0:
+                previous_author_id = getattr(
+                    getattr(history_messages[index - 1], "author", None),
+                    "id",
+                    None,
+                )
+                if previous_author_id == current_user_id:
+                    include_bot_message = True
+
+            if include_bot_message:
+                selected.append({"role": "assistant", "content": history_text})
+
+    bounded_history = selected[-max(0, max_messages) :]
+    current_text = _normalize_context_text(current_user_text)
+    if not current_text:
+        return bounded_history or [{"role": "user", "content": ""}]
+    return [*bounded_history, {"role": "user", "content": current_text}]
+
+
+async def build_followup_input(
+    message: discord.Message,
+    cleaned_message: str,
+) -> list[dict[str, str]]:
+    if not BOT_CONFIG:
+        return [{"role": "user", "content": cleaned_message}]
+    try:
+        history_messages = [
+            item
+            async for item in message.channel.history(
+                limit=max(1, BOT_CONFIG.followup_fetch_limit),
+                oldest_first=True,
+            )
+        ]
+    except Exception:
+        logging.exception("Failed to load channel history for follow-up context.")
+        return [{"role": "user", "content": cleaned_message}]
+
+    current_user_id = getattr(message.author, "id", None)
+    if not isinstance(current_user_id, int):
+        return [{"role": "user", "content": cleaned_message}]
+
+    return build_bounded_conversation_messages(
+        history_messages=history_messages,
+        current_message_id=message.id,
+        current_user_id=current_user_id,
+        bot_user_id=client.user.id if client.user else None,
+        current_user_text=cleaned_message,
+        max_messages=BOT_CONFIG.followup_max_messages,
+        lookback_minutes=BOT_CONFIG.followup_lookback_minutes,
+    )
+
+
 def build_channel_reference_maps(
     guild: discord.Guild | None,
 ) -> tuple[dict[str, ChannelReference], dict[int, ChannelReference]]:
@@ -300,11 +424,15 @@ def add_channel_links_to_response(
     return linked_text
 
 
-def build_responses_payload(question: str, system_prompt: str, config: BotConfig) -> dict:
+def build_responses_payload(
+    input_payload: str | list[dict[str, str]],
+    system_prompt: str,
+    config: BotConfig,
+) -> dict:
     return {
         "model": config.azure_openai_deployment,
         "instructions": system_prompt,
-        "input": question,
+        "input": input_payload,
         "temperature": config.temperature,
         "max_output_tokens": config.max_output_tokens,
     }
@@ -326,13 +454,13 @@ def extract_response_text(response_json: dict) -> str:
     return "\n".join(text_chunks).strip()
 
 
-async def answer_question(question: str) -> str:
+async def answer_question(input_payload: str | list[dict[str, str]]) -> str:
     if not BOT_CONFIG:
         logging.error("Bot config is not initialized.")
         return "Inkwell is still booting. Please try again in a moment."
 
     endpoint_url = f"{BOT_CONFIG.azure_openai_endpoint}/openai/v1/responses"
-    payload = build_responses_payload(question, SYSTEM_PROMPT, BOT_CONFIG)
+    payload = build_responses_payload(input_payload, SYSTEM_PROMPT, BOT_CONFIG)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {BOT_CONFIG.azure_openai_api_key}",
@@ -407,8 +535,9 @@ async def on_message(message):
     if not cleaned_message:
         return
 
+    followup_input = await build_followup_input(message, cleaned_message)
     channel_refs_by_name, channel_refs_by_id = build_channel_reference_maps(message.guild)
-    response_text = await answer_question(cleaned_message)
+    response_text = await answer_question(followup_input)
     response_text = add_channel_links_to_response(
         response_text,
         channel_refs_by_name,
