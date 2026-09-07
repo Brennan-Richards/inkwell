@@ -7,7 +7,7 @@ from pathlib import Path
 
 import aiohttp
 import discord
-import PyPDF2
+import pypdf
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -90,10 +90,7 @@ def build_config() -> BotConfig:
     return BotConfig(
         discord_bot_token=_required_env("DISCORD_BOT_TOKEN"),
         azure_openai_api_key=_required_env("AZURE_OPENAI_API_KEY"),
-        azure_openai_endpoint=os.getenv(
-            "AZURE_OPENAI_ENDPOINT",
-            "https://your-resource-name.openai.azure.com",
-        ).rstrip("/"),
+        azure_openai_endpoint=_required_env("AZURE_OPENAI_ENDPOINT").rstrip("/"),
         azure_openai_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1"),
         temperature=_safe_float(os.getenv("INKWELL_TEMPERATURE"), 0.15),
         max_output_tokens=_safe_int(os.getenv("INKWELL_MAX_OUTPUT_TOKENS"), 700),
@@ -108,8 +105,9 @@ def build_config() -> BotConfig:
 
 def discover_default_knowledge_sources(base_dir: Path) -> list[Path]:
     candidate_paths: list[Path] = []
-    search_roots = [base_dir / "documentation", base_dir.parent]
+    search_roots = [base_dir / "docs" / "knowledge-base", base_dir / "documentation"]
     patterns = [
+        "*training-guide*.md",
         "*Inkwell*Training*Guide*.pdf",
         "*MASTER*DOCUMENT*.pdf",
         "*Master*Document*.pdf",
@@ -120,8 +118,6 @@ def discover_default_knowledge_sources(base_dir: Path) -> list[Path]:
             continue
         for pattern in patterns:
             candidate_paths.extend(sorted(root.glob(pattern)))
-
-    candidate_paths.append(base_dir / "page-one-docs-11042024.txt")
 
     # De-dupe while preserving order.
     unique_candidates: list[Path] = []
@@ -160,7 +156,7 @@ def resolve_knowledge_source(base_dir: Path, override_path: str | None) -> Path:
 def _read_pdf_text(path: Path) -> str:
     extracted_chunks: list[str] = []
     with path.open("rb") as file_handle:
-        pdf_reader = PyPDF2.PdfReader(file_handle)
+        pdf_reader = pypdf.PdfReader(file_handle)
         for page in pdf_reader.pages:
             extracted_chunks.append(page.extract_text() or "")
     return " ".join(extracted_chunks)
@@ -424,6 +420,43 @@ def add_channel_links_to_response(
     return linked_text
 
 
+# Discord rejects any single message longer than 2000 characters.
+DISCORD_MESSAGE_LIMIT = 2000
+
+
+def split_message_for_discord(
+    text: str,
+    limit: int = DISCORD_MESSAGE_LIMIT,
+) -> list[str]:
+    """Split a reply into chunks Discord will accept, preferring clean break points.
+
+    Breaks on paragraph, then line, then word boundaries; only a single word longer
+    than the limit is cut mid-word.
+    """
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        split_at = max(
+            window.rfind("\n\n"),
+            window.rfind("\n"),
+            window.rfind(" "),
+        )
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def build_responses_payload(
     input_payload: str | list[dict[str, str]],
     system_prompt: str,
@@ -543,7 +576,8 @@ async def on_message(message):
         channel_refs_by_name,
         channel_refs_by_id,
     )
-    await message.channel.send(response_text)
+    for chunk in split_message_for_discord(response_text):
+        await message.channel.send(chunk)
 
 
 def initialize_runtime() -> None:

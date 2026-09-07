@@ -99,14 +99,21 @@ class InkwellHelpersTest(unittest.TestCase):
             resolved = inkwell.resolve_knowledge_source(base_dir, str(override))
             self.assertEqual(resolved, override)
 
-    def test_resolve_knowledge_source_falls_back_to_txt_snapshot(self):
+    def test_resolve_knowledge_source_discovers_markdown_guide(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
-            fallback = base_dir / "page-one-docs-11042024.txt"
-            fallback.write_text("fallback docs", encoding="utf-8")
+            knowledge_dir = base_dir / "docs" / "knowledge-base"
+            knowledge_dir.mkdir(parents=True)
+            guide = knowledge_dir / "inkwell-training-guide.md"
+            guide.write_text("training guide", encoding="utf-8")
 
             resolved = inkwell.resolve_knowledge_source(base_dir, None)
-            self.assertEqual(resolved, fallback)
+            self.assertEqual(resolved, guide)
+
+    def test_resolve_knowledge_source_raises_when_nothing_is_found(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(FileNotFoundError):
+                inkwell.resolve_knowledge_source(Path(temp_dir), None)
 
     def test_load_knowledge_text_truncates_when_needed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -229,6 +236,44 @@ class InkwellHelpersTest(unittest.TestCase):
                 {"role": "user", "content": "Follow-up now"},
             ],
         )
+
+
+class SplitMessageForDiscordTest(unittest.TestCase):
+    def test_short_message_is_not_split(self):
+        self.assertEqual(inkwell.split_message_for_discord("hello"), ["hello"])
+
+    def test_empty_message_produces_no_chunks(self):
+        self.assertEqual(inkwell.split_message_for_discord(""), [])
+
+    def test_every_chunk_respects_the_limit(self):
+        text = " ".join(f"word{index}" for index in range(2000))
+        chunks = inkwell.split_message_for_discord(text)
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), inkwell.DISCORD_MESSAGE_LIMIT)
+
+    def test_splitting_preserves_all_words(self):
+        text = " ".join(f"word{index}" for index in range(2000))
+        chunks = inkwell.split_message_for_discord(text)
+
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_prefers_paragraph_boundaries(self):
+        first = "a" * 1500
+        second = "b" * 1000
+        chunks = inkwell.split_message_for_discord(f"{first}\n\n{second}")
+
+        self.assertEqual(chunks[0], first)
+        self.assertEqual(chunks[1], second)
+
+    def test_single_oversized_word_is_still_split(self):
+        text = "x" * 4500
+        chunks = inkwell.split_message_for_discord(text)
+
+        self.assertEqual("".join(chunks), text)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), inkwell.DISCORD_MESSAGE_LIMIT)
 
 
 if __name__ == "__main__":
