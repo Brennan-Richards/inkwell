@@ -276,5 +276,46 @@ class SplitMessageForDiscordTest(unittest.TestCase):
             self.assertLessEqual(len(chunk), inkwell.DISCORD_MESSAGE_LIMIT)
 
 
+class IdentityMapTest(unittest.TestCase):
+    def test_absent_or_blank_map_is_empty(self):
+        self.assertEqual(inkwell.parse_identity_map(None), {})
+        self.assertEqual(inkwell.parse_identity_map(""), {})
+
+    def test_parses_a_json_object(self):
+        parsed = inkwell.parse_identity_map('{"@server-owner": "@realhandle"}')
+        self.assertEqual(parsed, {"@server-owner": "@realhandle"})
+
+    def test_malformed_json_is_ignored_not_fatal(self):
+        self.assertEqual(inkwell.parse_identity_map("{not json"), {})
+
+    def test_non_object_json_is_ignored(self):
+        self.assertEqual(inkwell.parse_identity_map('["a", "b"]'), {})
+
+    def test_empty_map_leaves_text_untouched(self):
+        self.assertEqual(inkwell.apply_identity_map("ask the Server Owner", {}), "ask the Server Owner")
+
+    def test_substitutes_placeholders(self):
+        result = inkwell.apply_identity_map(
+            "Tag @server-owner or the Lead Editor.",
+            {"@server-owner": "@realowner", "the Lead Editor": "Dana"},
+        )
+        self.assertEqual(result, "Tag @realowner or Dana.")
+
+    def test_longest_placeholder_wins_over_a_prefix(self):
+        result = inkwell.apply_identity_map(
+            "the Server Owner decides",
+            {"Server Owner": "WRONG", "the Server Owner": "Dana"},
+        )
+        self.assertEqual(result, "Dana decides")
+
+    def test_published_documents_contain_no_real_identities(self):
+        """The repository ships role labels; identities arrive only at runtime."""
+        guide = Path(__file__).resolve().parent.parent / "docs" / "knowledge-base"
+        for document in guide.glob("*.md"):
+            text = document.read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"\d{3}[ .\-]\d{3}[ .\-]\d{4}", document.name)
+            self.assertNotRegex(text, r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", document.name)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -30,6 +31,7 @@ class BotConfig:
     followup_lookback_minutes: int
     allowed_channels: set[str]
     knowledge_override_path: str | None
+    identity_map: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,38 @@ def parse_allowed_channels(raw_value: str | None) -> set[str]:
         return {"ask-inkwell"}
     channels = {item.strip().lower() for item in raw_value.split(",") if item.strip()}
     return channels or {"ask-inkwell"}
+
+
+def parse_identity_map(raw_value: str | None) -> dict[str, str]:
+    """Parse INKWELL_IDENTITY_MAP: a JSON object of placeholder -> real identity.
+
+    The published documents name people by role. A deployment supplies the real
+    names and handles here at runtime, so those identities never enter the
+    repository. Invalid values are ignored rather than fatal: a malformed map
+    should degrade the bot to role labels, not stop it answering.
+    """
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError:
+        logging.warning("INKWELL_IDENTITY_MAP is not valid JSON. Ignoring it.")
+        return {}
+    if not isinstance(parsed, dict):
+        logging.warning("INKWELL_IDENTITY_MAP must be a JSON object. Ignoring it.")
+        return {}
+    return {str(key): str(value) for key, value in parsed.items() if str(key)}
+
+
+def apply_identity_map(text: str, identity_map: dict[str, str]) -> str:
+    """Replace role placeholders in the knowledge text with real identities."""
+    if not identity_map:
+        return text
+    # Longest placeholder first, so overlapping keys resolve predictably
+    # ("the Server Owner" must win over "Server Owner").
+    for placeholder in sorted(identity_map, key=len, reverse=True):
+        text = text.replace(placeholder, identity_map[placeholder])
+    return text
 
 
 def _safe_int(value: str | None, default: int) -> int:
@@ -100,6 +134,7 @@ def build_config() -> BotConfig:
         followup_lookback_minutes=_safe_int(os.getenv("INKWELL_FOLLOWUP_LOOKBACK_MINUTES"), 90),
         allowed_channels=parse_allowed_channels(os.getenv("INKWELL_ALLOWED_CHANNELS")),
         knowledge_override_path=os.getenv("INKWELL_MASTER_DOCUMENT_PATH"),
+        identity_map=parse_identity_map(os.getenv("INKWELL_IDENTITY_MAP")),
     )
 
 
@@ -586,6 +621,7 @@ def initialize_runtime() -> None:
     BOT_CONFIG = build_config()
     knowledge_source = resolve_knowledge_source(BASE_DIR, BOT_CONFIG.knowledge_override_path)
     knowledge_text = load_knowledge_text(knowledge_source, BOT_CONFIG.max_knowledge_chars)
+    knowledge_text = apply_identity_map(knowledge_text, BOT_CONFIG.identity_map)
 
     KNOWLEDGE_SOURCE_PATH = str(knowledge_source)
     PAGE_ONE_DOCUMENTATION = knowledge_text
@@ -597,6 +633,7 @@ def initialize_runtime() -> None:
         knowledge_source,
     )
     logging.info("Allowed response channels: %s", sorted(BOT_CONFIG.allowed_channels))
+    logging.info("Identity map entries applied: %d", len(BOT_CONFIG.identity_map))
 
 
 def main() -> None:

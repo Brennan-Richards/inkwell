@@ -124,6 +124,23 @@ The check is deliberately shape-based rather than a list of the specific names
 and handles that were removed. A checklist of real personal details, committed
 to a public repository, would leak exactly what the redaction took out.
 
+### Real identities at runtime
+
+Routing advice is more useful when it names a person, but those names should not
+live in a public repository. So they don't: the documents ship with role labels,
+and a deployment supplies the real identities through `INKWELL_IDENTITY_MAP`, a
+JSON object applied to the knowledge text at startup.
+
+```json
+{"@server-owner": "@realhandle", "the Lead Editor": "Dana"}
+```
+
+Set it as an environment variable and the running bot answers with real handles;
+leave it unset and the bot degrades to role labels. Either way the repository
+only ever contains the labels, so there is one codebase rather than a public
+copy and a private fork that quietly drift apart. A malformed map is logged and
+ignored rather than fatal — a bad config should cost you names, not the bot.
+
 To point Inkwell at your own community, replace these files, or set
 `INKWELL_MASTER_DOCUMENT_PATH`. Markdown, plain text, and PDF are all accepted.
 
