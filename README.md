@@ -62,6 +62,18 @@ mentions, so routing advice is one click. It matches hashtags, bare names
 followed by "channel", and existing mentions, without double-formatting text
 that is already correct.
 
+**Access control is the spend boundary, so it fails closed.** Every answer costs
+an Azure OpenAI call, which makes "who may ask" a billing question rather than a
+politeness one. `INKWELL_ALLOWED_GUILD_IDS` is required: unset, the bot answers
+nobody. A mention does not bypass it, so adding the bot to another server buys
+that server nothing. Direct messages are off by default, and when enabled the
+author is verified as a member of an allowed guild — over REST, so the bot does
+not need the privileged members intent.
+
+Two sliding-window rate limits sit behind that gate: one per user, and a global
+one that caps total hourly spend even if every member asks at once. Both are
+checked after the cheap gates and before anything is paid for.
+
 **The core is pure functions.** Message gating, context assembly, channel
 linking, response parsing, and message splitting are all free of Discord and
 Azure objects — they take plain values and return plain values. Everything
@@ -148,9 +160,6 @@ To point Inkwell at your own community, replace these files, or set
 
 Worth being straight about, since this ran in production for a real community:
 
-- **No rate limiting.** Every qualifying message is one Azure OpenAI call.
-  Fine for a single moderated channel; a per-user token bucket is the first
-  thing to add before opening it up server-wide.
 - **The whole document is re-sent on every request.** Simple and correct, but
   it means ~16k tokens of input per question. Prompt caching, or chunking once
   the corpus grows, is the obvious next step.

@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +32,11 @@ class BotConfig:
     followup_max_messages: int
     followup_lookback_minutes: int
     allowed_channels: set[str]
+    allowed_guild_ids: set[int]
+    allow_dms: bool
+    user_rate_limit: int
+    global_rate_limit: int
+    rate_limit_window_seconds: int
     knowledge_override_path: str | None
     identity_map: dict[str, str]
 
@@ -59,6 +66,68 @@ def parse_allowed_channels(raw_value: str | None) -> set[str]:
         return {"ask-inkwell"}
     channels = {item.strip().lower() for item in raw_value.split(",") if item.strip()}
     return channels or {"ask-inkwell"}
+
+
+def parse_guild_ids(raw_value: str | None) -> set[int]:
+    """Parse INKWELL_ALLOWED_GUILD_IDS, a comma-separated list of Discord guild ids.
+
+    An empty result means "no guild is allowed". This is deliberate: the bot
+    spends money on every answer, so an unset allowlist must fail closed rather
+    than serve whichever server the bot happens to have been added to.
+    """
+    if not raw_value:
+        return set()
+    guild_ids: set[int] = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            guild_ids.add(int(item))
+        except ValueError:
+            logging.warning("Ignoring non-numeric guild id %r.", item)
+    return guild_ids
+
+
+def _parse_bool(raw_value: str | None, *, default: bool) -> bool:
+    if raw_value is None or not raw_value.strip():
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class SlidingWindowRateLimiter:
+    """Caps how many events a key may record inside a rolling time window.
+
+    Used to bound Azure OpenAI spend: one limiter per user, one for the whole
+    bot. A limit of zero or less disables the check.
+    """
+
+    def __init__(self, max_events: int, window_seconds: float):
+        self.max_events = max_events
+        self.window_seconds = max(1.0, float(window_seconds))
+        self._events: dict[str, deque[float]] = defaultdict(deque)
+
+    def allow(self, key: str, now: float) -> bool:
+        """Record an event for `key` and report whether it was within the limit."""
+        if self.max_events <= 0:
+            return True
+
+        bucket = self._events[key]
+        cutoff = now - self.window_seconds
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+        if len(bucket) >= self.max_events:
+            return False
+
+        bucket.append(now)
+        return True
+
+    def prune(self, now: float) -> None:
+        """Drop keys with no recent events so the map cannot grow without bound."""
+        cutoff = now - self.window_seconds
+        for key in [k for k, b in self._events.items() if not b or b[-1] <= cutoff]:
+            del self._events[key]
 
 
 def parse_identity_map(raw_value: str | None) -> dict[str, str]:
@@ -133,6 +202,11 @@ def build_config() -> BotConfig:
         followup_max_messages=_safe_int(os.getenv("INKWELL_FOLLOWUP_MAX_MESSAGES"), 12),
         followup_lookback_minutes=_safe_int(os.getenv("INKWELL_FOLLOWUP_LOOKBACK_MINUTES"), 90),
         allowed_channels=parse_allowed_channels(os.getenv("INKWELL_ALLOWED_CHANNELS")),
+        allowed_guild_ids=parse_guild_ids(os.getenv("INKWELL_ALLOWED_GUILD_IDS")),
+        allow_dms=_parse_bool(os.getenv("INKWELL_ALLOW_DMS"), default=False),
+        user_rate_limit=_safe_int(os.getenv("INKWELL_USER_RATE_LIMIT"), 10),
+        global_rate_limit=_safe_int(os.getenv("INKWELL_GLOBAL_RATE_LIMIT"), 200),
+        rate_limit_window_seconds=_safe_int(os.getenv("INKWELL_RATE_LIMIT_WINDOW_SECONDS"), 600),
         knowledge_override_path=os.getenv("INKWELL_MASTER_DOCUMENT_PATH"),
         identity_map=parse_identity_map(os.getenv("INKWELL_IDENTITY_MAP")),
     )
@@ -236,10 +310,27 @@ def should_respond_to_message(
     channel_name: str,
     mentions_bot: bool,
     allowed_channels: set[str],
+    guild_id: int | None,
+    allowed_guild_ids: set[int],
+    allow_dms: bool,
 ) -> bool:
+    """Decide whether a message earns an answer.
+
+    Every answer costs an Azure OpenAI call, so this gate is the spend boundary
+    and fails closed: a message from an unlisted guild is refused even if it
+    mentions the bot, and direct messages are refused unless explicitly enabled.
+    """
     if author_is_bot:
         return False
-    if is_dm or mentions_bot:
+
+    if is_dm:
+        # DM membership is verified separately by the caller, which can await it.
+        return allow_dms
+
+    if guild_id is None or guild_id not in allowed_guild_ids:
+        return False
+
+    if mentions_bot:
         return True
     return channel_name.lower() in allowed_channels
 
@@ -565,6 +656,34 @@ async def answer_question(input_payload: str | list[dict[str, str]]) -> str:
         )
 
 
+USER_RATE_LIMITER: SlidingWindowRateLimiter | None = None
+GLOBAL_RATE_LIMITER: SlidingWindowRateLimiter | None = None
+GLOBAL_RATE_LIMIT_KEY = "global"
+
+
+async def author_is_allowed_guild_member(user_id: int, allowed_guild_ids: set[int]) -> bool:
+    """Confirm a DM author actually belongs to one of the allowed guilds.
+
+    Without this, anyone who can open a DM with the bot could spend the API
+    budget. Fetched over REST rather than read from cache so the bot does not
+    need the privileged members intent.
+    """
+    for guild_id in allowed_guild_ids:
+        guild = client.get_guild(guild_id)
+        if guild is None:
+            continue
+        try:
+            await guild.fetch_member(user_id)
+            return True
+        except discord.NotFound:
+            continue
+        except discord.HTTPException:
+            logging.exception("Membership check failed for guild %s.", guild_id)
+            # Fail closed: an unverifiable member does not get a paid answer.
+            continue
+    return False
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -587,13 +706,29 @@ async def on_message(message):
     channel_name = getattr(message.channel, "name", "")
     author_is_bot = bool(getattr(message.author, "bot", False))
 
+    guild_id = getattr(message.guild, "id", None)
+
     if not should_respond_to_message(
         author_is_bot=author_is_bot,
         is_dm=is_dm,
         channel_name=channel_name,
         mentions_bot=mentions_bot,
         allowed_channels=BOT_CONFIG.allowed_channels,
+        guild_id=guild_id,
+        allowed_guild_ids=BOT_CONFIG.allowed_guild_ids,
+        allow_dms=BOT_CONFIG.allow_dms,
     ):
+        return
+
+    author_id = getattr(message.author, "id", None)
+    if not isinstance(author_id, int):
+        return
+
+    # A DM author must still be a member of an allowed guild.
+    if is_dm and not await author_is_allowed_guild_member(
+        author_id, BOT_CONFIG.allowed_guild_ids
+    ):
+        logging.info("Ignoring DM from non-member %s.", author_id)
         return
 
     cleaned_message = strip_bot_mentions(
@@ -602,6 +737,21 @@ async def on_message(message):
     )
     if not cleaned_message:
         return
+
+    # Spend guard. Checked after the cheap gates and before any paid call.
+    now = time.monotonic()
+    if GLOBAL_RATE_LIMITER and not GLOBAL_RATE_LIMITER.allow(GLOBAL_RATE_LIMIT_KEY, now):
+        logging.warning("Global rate limit reached; declining to call the API.")
+        return
+    if USER_RATE_LIMITER and not USER_RATE_LIMITER.allow(str(author_id), now):
+        logging.info("User %s hit their rate limit.", author_id)
+        await message.channel.send(
+            "You've asked me a lot in a short window. Give me a few minutes, "
+            "or ask in #server-questions if it's urgent."
+        )
+        return
+    if USER_RATE_LIMITER:
+        USER_RATE_LIMITER.prune(now)
 
     followup_input = await build_followup_input(message, cleaned_message)
     channel_refs_by_name, channel_refs_by_id = build_channel_reference_maps(message.guild)
@@ -617,6 +767,7 @@ async def on_message(message):
 
 def initialize_runtime() -> None:
     global BOT_CONFIG, KNOWLEDGE_SOURCE_PATH, PAGE_ONE_DOCUMENTATION, SYSTEM_PROMPT
+    global USER_RATE_LIMITER, GLOBAL_RATE_LIMITER
 
     BOT_CONFIG = build_config()
     knowledge_source = resolve_knowledge_source(BASE_DIR, BOT_CONFIG.knowledge_override_path)
@@ -634,6 +785,27 @@ def initialize_runtime() -> None:
     )
     logging.info("Allowed response channels: %s", sorted(BOT_CONFIG.allowed_channels))
     logging.info("Identity map entries applied: %d", len(BOT_CONFIG.identity_map))
+
+    USER_RATE_LIMITER = SlidingWindowRateLimiter(
+        BOT_CONFIG.user_rate_limit, BOT_CONFIG.rate_limit_window_seconds
+    )
+    GLOBAL_RATE_LIMITER = SlidingWindowRateLimiter(
+        BOT_CONFIG.global_rate_limit, 3600
+    )
+
+    if not BOT_CONFIG.allowed_guild_ids:
+        logging.error(
+            "INKWELL_ALLOWED_GUILD_IDS is not set. The bot will answer nobody. "
+            "Set it to the guild id(s) Inkwell serves."
+        )
+    logging.info("Allowed guild ids: %s", sorted(BOT_CONFIG.allowed_guild_ids))
+    logging.info("Direct messages enabled: %s", BOT_CONFIG.allow_dms)
+    logging.info(
+        "Rate limits: %d per user / %ds, %d global / hour",
+        BOT_CONFIG.user_rate_limit,
+        BOT_CONFIG.rate_limit_window_seconds,
+        BOT_CONFIG.global_rate_limit,
+    )
 
 
 def main() -> None:

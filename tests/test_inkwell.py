@@ -5,6 +5,24 @@ from pathlib import Path
 
 import inkwell
 
+ALLOWED_GUILD = 4242
+
+
+def gate(**overrides):
+    """should_respond_to_message with the common allow-everything defaults."""
+    kwargs = dict(
+        author_is_bot=False,
+        is_dm=False,
+        channel_name="ask-inkwell",
+        mentions_bot=False,
+        allowed_channels={"ask-inkwell"},
+        guild_id=ALLOWED_GUILD,
+        allowed_guild_ids={ALLOWED_GUILD},
+        allow_dms=False,
+    )
+    kwargs.update(overrides)
+    return inkwell.should_respond_to_message(**kwargs)
+
 
 class FakeAuthor:
     def __init__(self, author_id: int):
@@ -49,20 +67,8 @@ class InkwellHelpersTest(unittest.TestCase):
         self.assertEqual(channels, {"ask-inkwell", "server-questions"})
 
     def test_should_respond_only_in_allowed_channels_without_mention(self):
-        should_reply = inkwell.should_respond_to_message(
-            author_is_bot=False,
-            is_dm=False,
-            channel_name="ask-inkwell",
-            mentions_bot=False,
-            allowed_channels={"ask-inkwell"},
-        )
-        should_not_reply = inkwell.should_respond_to_message(
-            author_is_bot=False,
-            is_dm=False,
-            channel_name="general",
-            mentions_bot=False,
-            allowed_channels={"ask-inkwell"},
-        )
+        should_reply = gate(channel_name="ask-inkwell")
+        should_not_reply = gate(channel_name="general")
         self.assertTrue(should_reply)
         self.assertFalse(should_not_reply)
 
@@ -315,6 +321,85 @@ class IdentityMapTest(unittest.TestCase):
             text = document.read_text(encoding="utf-8")
             self.assertNotRegex(text, r"\d{3}[ .\-]\d{3}[ .\-]\d{4}", document.name)
             self.assertNotRegex(text, r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", document.name)
+
+
+class AccessControlTest(unittest.TestCase):
+    def test_bots_are_always_ignored(self):
+        self.assertFalse(gate(author_is_bot=True))
+
+    def test_message_from_an_unlisted_guild_is_refused(self):
+        self.assertFalse(gate(guild_id=9999))
+
+    def test_mention_does_not_bypass_the_guild_allowlist(self):
+        """A mention from an unlisted server must not buy an API call."""
+        self.assertFalse(gate(guild_id=9999, mentions_bot=True, channel_name="general"))
+
+    def test_empty_allowlist_fails_closed(self):
+        self.assertFalse(gate(allowed_guild_ids=set()))
+
+    def test_mention_in_a_non_allowed_channel_of_an_allowed_guild_works(self):
+        self.assertTrue(gate(channel_name="general", mentions_bot=True))
+
+    def test_dms_are_refused_by_default(self):
+        self.assertFalse(gate(is_dm=True, guild_id=None))
+
+    def test_dms_allowed_when_enabled(self):
+        self.assertTrue(gate(is_dm=True, guild_id=None, allow_dms=True))
+
+
+class ParseGuildIdsTest(unittest.TestCase):
+    def test_unset_is_empty_so_the_bot_fails_closed(self):
+        self.assertEqual(inkwell.parse_guild_ids(None), set())
+        self.assertEqual(inkwell.parse_guild_ids(""), set())
+
+    def test_parses_a_comma_separated_list(self):
+        self.assertEqual(inkwell.parse_guild_ids(" 12, 34 ,"), {12, 34})
+
+    def test_non_numeric_entries_are_skipped(self):
+        self.assertEqual(inkwell.parse_guild_ids("12,nope,34"), {12, 34})
+
+
+class RateLimiterTest(unittest.TestCase):
+    def test_allows_up_to_the_limit_then_refuses(self):
+        limiter = inkwell.SlidingWindowRateLimiter(3, 60)
+        self.assertTrue(all(limiter.allow("u", 100.0) for _ in range(3)))
+        self.assertFalse(limiter.allow("u", 100.0))
+
+    def test_window_slides(self):
+        limiter = inkwell.SlidingWindowRateLimiter(2, 60)
+        limiter.allow("u", 0.0)
+        limiter.allow("u", 1.0)
+        self.assertFalse(limiter.allow("u", 2.0))
+        # once the first two events age out, capacity returns
+        self.assertTrue(limiter.allow("u", 62.0))
+
+    def test_keys_are_independent(self):
+        limiter = inkwell.SlidingWindowRateLimiter(1, 60)
+        self.assertTrue(limiter.allow("alice", 0.0))
+        self.assertFalse(limiter.allow("alice", 0.0))
+        self.assertTrue(limiter.allow("bob", 0.0))
+
+    def test_zero_limit_disables_the_check(self):
+        limiter = inkwell.SlidingWindowRateLimiter(0, 60)
+        self.assertTrue(all(limiter.allow("u", 0.0) for _ in range(50)))
+
+    def test_prune_drops_stale_keys(self):
+        limiter = inkwell.SlidingWindowRateLimiter(5, 60)
+        limiter.allow("u", 0.0)
+        limiter.prune(500.0)
+        self.assertEqual(len(limiter._events), 0)
+
+
+class ParseBoolTest(unittest.TestCase):
+    def test_default_is_used_when_unset(self):
+        self.assertFalse(inkwell._parse_bool(None, default=False))
+        self.assertTrue(inkwell._parse_bool("  ", default=True))
+
+    def test_truthy_and_falsey_values(self):
+        for raw in ("1", "true", "TRUE", "yes", "on"):
+            self.assertTrue(inkwell._parse_bool(raw, default=False), raw)
+        for raw in ("0", "false", "no", "off", "nonsense"):
+            self.assertFalse(inkwell._parse_bool(raw, default=True), raw)
 
 
 if __name__ == "__main__":
